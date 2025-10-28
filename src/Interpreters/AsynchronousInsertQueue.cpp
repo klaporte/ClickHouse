@@ -1,3 +1,5 @@
+#include <memory>
+#include <unordered_set>
 #include <Interpreters/AsynchronousInsertQueue.h>
 
 #include <Access/Common/AccessFlags.h>
@@ -19,6 +21,8 @@
 #include <Interpreters/InterpreterInsertQuery.h>
 #include <Interpreters/ProcessList.h>
 #include <Interpreters/executeQuery.h>
+#include <Interpreters/InsertDeduplication.h>
+#include <Interpreters/StorageID.h>
 #include <Parsers/ASTInsertQuery.h>
 #include <Parsers/ASTLiteral.h>
 #include <Parsers/queryNormalization.h>
@@ -180,6 +184,24 @@ AsynchronousInsertQueue::InsertQuery::operator=(const InsertQuery & other)
 bool AsynchronousInsertQueue::InsertQuery::operator==(const InsertQuery & other) const
 {
     return toTupleCmp() == other.toTupleCmp();
+}
+
+StorageID AsynchronousInsertQueue::InsertQuery::getStorageID() const
+{
+    if (!query)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "InsertQuery AST is null");
+
+    auto * insert_query = query->as<ASTInsertQuery>();
+    if (!insert_query)
+        throw Exception(ErrorCodes::LOGICAL_ERROR, "AST is not of type ASTInsertQuery");
+
+    auto database = insert_query->getDatabase();
+    auto table = insert_query->getTable();
+
+    if (database.empty() && table.empty())
+        return StorageID::createEmpty();
+
+    return StorageID(database, table);
 }
 
 AsynchronousInsertQueue::InsertData::Entry::Entry(
@@ -651,6 +673,84 @@ void AsynchronousInsertQueue::validateSettings(const Settings & settings, Logger
         throw Exception(ErrorCodes::INVALID_SETTING_VALUE, "Setting 'async_insert_busy_timeout_decrease_rate' must be greater than zero");
 }
 
+void AsynchronousInsertQueue::flush(const Strings & table_names)
+{
+    if (table_names.empty())
+    {
+        flushAll();
+        return;
+    }
+
+    auto database_table_name_set = std::set<std::pair<String, String>>{};
+    for (const auto & full_table_name : table_names)
+    {
+        auto dot_pos = full_table_name.find('.');
+        if (dot_pos == String::npos)
+            database_table_name_set.emplace("", full_table_name);
+        else
+            database_table_name_set.emplace(full_table_name.substr(0, dot_pos), full_table_name.substr(dot_pos + 1));
+    }
+
+    LOG_DEBUG(log, "Requested to flush asynchronous insert queue for tables: {}", fmt::join(table_names, ", "));
+
+    auto affected_set = std::set<String>{};
+    std::vector<Queue> queues_to_flush(pool_size);
+
+    std::lock_guard flush_lock(flush_mutex);
+
+    for (size_t i = 0; i < pool_size; ++i)
+    {
+        std::lock_guard lock(queue_shards[i].mutex);
+        auto & shard = queue_shards[i];
+        auto & queue = shard.queue;
+
+        for (auto it = queue.begin(); it != queue.end();)
+        {
+            const auto storage = it->second.key.getStorageID();
+            /// it is not strick match of database and table name
+            /// async insert queue does not store database name always
+            if (!database_table_name_set.contains({storage.database_name, storage.table_name})
+                && !database_table_name_set.contains({"", storage.table_name}))
+            {
+                ++it;
+                continue;
+            }
+
+            affected_set.emplace(storage.getNameForLogs());
+            queues_to_flush[i].emplace(it->first, std::move(it->second));
+            shard.iterators.erase(it->second.key.hash);
+            it = queue_shards[i].queue.erase(it);
+        }
+    }
+
+    size_t total_queries = 0;
+    size_t total_bytes = 0;
+    size_t total_entries = 0;
+
+    for (size_t i = 0; i < pool_size; ++i)
+    {
+        auto & queue = queues_to_flush[i];
+        total_queries += queue.size();
+        for (auto & [_, entry] : queue)
+        {
+            total_bytes += entry.data->size_in_bytes;
+            total_entries += entry.data->entries.size();
+            scheduleDataProcessingJob(entry.key, std::move(entry.data), getContext(), i);
+        }
+    }
+
+    /// Note that jobs scheduled before the call of 'flushAll' are not counted here.
+    LOG_DEBUG(log,
+        "Will wait for finishing of {} flushing jobs (about {} inserts, {} bytes, {} distinct queries) for tables: {}",
+        pool.active(), total_entries, total_bytes, total_queries, fmt::join(affected_set, ", "));
+
+    /// Wait until all jobs are finished. That includes also jobs
+    /// that were scheduled before the call of 'flushAll'.
+    pool.wait();
+
+    LOG_DEBUG(log, "Finished flushing of asynchronous insert queue for tables: {}", fmt::join(affected_set, ", "));
+}
+
 void AsynchronousInsertQueue::flushAll()
 {
     std::lock_guard flush_lock(flush_mutex);
@@ -1102,7 +1202,6 @@ Chunk AsynchronousInsertQueue::processEntriesWithParsing(
         return 0;
     };
 
-
     StreamingFormatExecutor executor(
         header,
         format,
@@ -1110,7 +1209,8 @@ Chunk AsynchronousInsertQueue::processEntriesWithParsing(
         data->size_in_bytes,
         data->entries.size(),
         std::move(adding_defaults_transform));
-    auto chunk_info = std::make_shared<AsyncInsertInfo>();
+
+    auto deduplication_info = DeduplicationInfo::create(true);
 
     for (const auto & entry : data->entries)
     {
@@ -1129,14 +1229,8 @@ Chunk AsynchronousInsertQueue::processEntriesWithParsing(
 
         total_rows += num_rows;
 
-        /// For some reason, client can pass zero rows and bytes to server.
-        /// We don't update offsets in this case, because we assume every insert has some rows during dedup
-        /// but we have nothing to deduplicate for this insert.
-        if (num_rows > 0)
-        {
-            chunk_info->offsets.push_back(total_rows);
-            chunk_info->tokens.push_back(entry->async_dedup_token);
-        }
+        /// it is ok if total_rows is 0 here or async_dedup_token is empty
+        deduplication_info->setUserToken(entry->async_dedup_token, num_rows);
 
         add_to_async_insert_log(entry, current_exception, num_rows, num_bytes);
         current_exception.clear();
@@ -1144,7 +1238,7 @@ Chunk AsynchronousInsertQueue::processEntriesWithParsing(
     }
 
     Chunk chunk(executor.getResultColumns(), total_rows);
-    chunk.getChunkInfos().add(std::move(chunk_info));
+    chunk.getChunkInfos().add(std::move(deduplication_info));
     return chunk;
 }
 
@@ -1155,7 +1249,7 @@ Chunk AsynchronousInsertQueue::processPreprocessedEntries(
     LogFunc && add_to_async_insert_log)
 {
     size_t total_rows = 0;
-    auto chunk_info = std::make_shared<AsyncInsertInfo>();
+    auto deduplication_info = DeduplicationInfo::create(true);
     auto result_columns = header.cloneEmptyColumns();
 
     for (const auto & entry : data->entries)
@@ -1182,21 +1276,14 @@ Chunk AsynchronousInsertQueue::processPreprocessedEntries(
 
         total_rows += block_to_insert.rows();
 
-        /// For some reason, client can pass zero rows and bytes to server.
-        /// We don't update offsets in this case, because we assume every insert has some rows during dedup,
-        /// but we have nothing to deduplicate for this insert.
-        if (block_to_insert.rows() > 0)
-        {
-            chunk_info->offsets.push_back(total_rows);
-            chunk_info->tokens.push_back(entry->async_dedup_token);
-        }
+        deduplication_info->setUserToken(entry->async_dedup_token, block_to_insert.rows());
 
         add_to_async_insert_log(entry, /*parsing_exception=*/ "", block_to_insert.rows(), block_to_insert.bytes());
         entry->resetChunk();
     }
 
     Chunk chunk(std::move(result_columns), total_rows);
-    chunk.getChunkInfos().add(std::move(chunk_info));
+    chunk.getChunkInfos().add(std::move(deduplication_info));
     return chunk;
 }
 

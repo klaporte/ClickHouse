@@ -174,7 +174,7 @@ public:
 
     std::vector<String> src_replicas;
 
-    Strings logs;
+    Strings tables;
 
     ServerType server_type;
 
