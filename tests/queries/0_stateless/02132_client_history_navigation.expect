@@ -50,6 +50,7 @@ expect ":) "
 send -- "\033\[A"
 expect "SELECT 'unique2'"
 send -- "\033\[B"
+expect ":) "
 
 send -- "exit\r"
 expect eof
