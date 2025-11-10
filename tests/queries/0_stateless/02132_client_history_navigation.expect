@@ -43,5 +43,13 @@ expect "'unique2'"
 # Second is the response from the server
 expect "'unique2'"
 
+# Queries starting with a space should not be recorded to a history file.
+send -- " SELECT 'a secret'\r"
+expect "'a secret'"
+expect ":) "
+send -- "\033\[A"
+expect "SELECT 'unique2'"
+send -- "\025"
+
 send -- "exit\r"
 expect eof
